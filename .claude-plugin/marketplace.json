@@ -1,0 +1,12 @@
+{
+  "name": "local-mods",
+  "owner": { "name": "Alta Falconeri" },
+  "metadata": { "description": "Personal Claude Code mods." },
+  "plugins": [
+    {
+      "name": "usage-limits",
+      "source": "./usage-limits",
+      "description": "Shows the 5-hour session and weekly usage limits above the prompt."
+    }
+  ]
+}

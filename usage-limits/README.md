@@ -18,5 +18,5 @@ Limits:
 - It shows nothing with API-key billing, where there are no rate-limit windows.
 - Below 70 columns, the bars are hidden.
 
-Try it: `claude --plugin-dir ./usage-limits`
+Try it (from the repo root): `claude --plugin-dir ./usage-limits`
 Install: `claude plugin marketplace add https://github.com/falconeri/claude-usage-limit.git` then `claude plugin install usage-limits@local-mods --scope user`
