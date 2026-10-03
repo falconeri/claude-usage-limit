@@ -1,0 +1,6 @@
+{
+  "name": "usage-limits",
+  "version": "0.1.0",
+  "description": "Shows plan usage limits above the prompt: the current 5-hour session and the weekly limit, with reset times.",
+  "author": { "name": "Alta Falconeri" }
+}
