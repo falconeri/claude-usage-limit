@@ -19,4 +19,4 @@ Limits:
 - Below 70 columns, the bars are hidden.
 
 Try it: `claude --plugin-dir ./usage-limits`
-Install: `claude plugin marketplace add ~/.claude/mods-src` then `claude plugin install usage-limits@local-mods --scope user`
+Install: `claude plugin marketplace add https://github.com/falconeri/claude-usage-limit.git` then `claude plugin install usage-limits@local-mods --scope user`
