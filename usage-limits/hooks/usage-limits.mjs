@@ -1,19 +1,20 @@
-// Usage Limits: the plan's rate-limit windows, above the prompt.
+// Usage Limits: git branch, context usage and the plan's rate-limit windows,
+// as one status line under the prompt.
 //
-// session.start: take a first reading, so the band shows before any turn
-// (empty until the first response reports the windows).
+// session.start: take a first reading, so the line shows before any turn
+// (limits and context stay empty until the first response reports them).
 // session.measure: the engine pushes $.session.usage()'s figures after each
-// main-thread turn and whenever a window moves a whole point; keep the
-// five_hour (current session) and seven_day (weekly) windows.
-// ui.render (AbovePrompt): one line per window kind: a bar, the percent
-// used and how long until it resets. A one-minute clock keeps the
-// countdown fresh between turns.
+// main-thread turn and whenever a unit moves; keep the context window fill and
+// the five_hour (current session) and seven_day (weekly) windows.
+// A one-minute clock re-reads the git branch and keeps the reset countdown
+// fresh between turns.
 //
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
 
 const TICK_MS = 60_000;
 const BAR_WIDTH = 10;
+const SEPARATOR = "  │  ";
 
 const LABELS = {
   five_hour: "Session",
@@ -26,6 +27,10 @@ const ORDER = ["five_hour", "seven_day", "spend_limit"];
 
 // { kind, percentUsed, resetsAt }, as the last response reported them.
 let limits = [];
+// { tokens, window, percent }, the live context window; percent is absent
+// until the first response of the window.
+let context = null;
+let branch = "";
 let now = 0;
 let ticker = null;
 
@@ -33,6 +38,7 @@ export function register(on) {
   on("session.start", async ($, e, next) => {
     const result = await next(e);
     limits = [];
+    context = null;
     await takeReading($);
     startTicker($);
     return result;
@@ -42,30 +48,29 @@ export function register(on) {
     const result = await next(e);
     if (e.changed.includes("rateLimits")) {
       limits = sorted(e.rateLimits ?? []);
-      now = await $.clock.now();
-      $.ui.invalidate("ui.render");
     }
+    if (e.changed.includes("context")) {
+      context = e.context ?? null;
+    }
+    now = await $.clock.now();
+    // A turn is when the branch is most likely to have changed.
+    branch = await readBranch($);
+    draw($);
     return result;
-  });
-
-  on("ui.render", { component: "AbovePrompt" }, ($, e, next) => {
-    if (e.hasSurvey || limits.length === 0) {
-      return next(e);
-    }
-    const { Box, Text } = $.ui.resolve(e);
-    return band(Box, Text, e.bodyColumns ?? 80);
   });
 }
 
 async function takeReading($) {
   try {
-    const { rateLimits } = await $.session.usage();
-    limits = sorted(rateLimits ?? []);
+    const usage = await $.session.usage();
+    limits = sorted(usage.rateLimits ?? []);
+    context = usage.context ?? null;
     now = await $.clock.now();
-    $.ui.invalidate("ui.render");
   } catch {
-    // No reading; the band keeps the last one.
+    // No reading; the line keeps the last one.
   }
+  branch = await readBranch($);
+  draw($);
 }
 
 // Redraws once a minute so "resets in" counts down while the session idles.
@@ -77,11 +82,37 @@ function startTicker($) {
 }
 
 async function tick($) {
-  if (limits.length === 0) {
-    return;
-  }
   now = await $.clock.now();
-  $.ui.invalidate("ui.render");
+  branch = await readBranch($);
+  draw($);
+}
+
+// The checked-out branch, the short commit when detached, "" outside a repo.
+async function readBranch($) {
+  try {
+    const named = await $.process.run(["git", "symbolic-ref", "--short", "-q", "HEAD"]);
+    if (named.exitCode === 0 && named.stdout.trim()) {
+      return named.stdout.trim();
+    }
+    const detached = await $.process.run(["git", "rev-parse", "--short", "HEAD"]);
+    return detached.exitCode === 0 ? detached.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function draw($) {
+  const segments = [];
+  if (branch) {
+    segments.push(`⎇ ${branch}`);
+  }
+  if (context?.percent !== undefined) {
+    segments.push(contextSegment(context));
+  }
+  for (const limit of limits) {
+    segments.push(limitSegment(limit));
+  }
+  $.ui.status(segments.length > 0 ? segments.join(SEPARATOR) : undefined);
 }
 
 function sorted(rateLimits) {
@@ -92,40 +123,16 @@ function sorted(rateLimits) {
   return [...rateLimits].sort((a, b) => rank(a.kind) - rank(b.kind));
 }
 
-function band(Box, Text, columns) {
-  const wide = columns >= 70;
-  const parts = [];
-  limits.forEach((limit, i) => {
-    if (i > 0) {
-      parts.push(Text({ dimColor: true, children: "   │   " }));
-    }
-    parts.push(...windowParts(Text, limit, wide));
-  });
-  return Box({ flexDirection: "row", paddingX: 1, children: parts });
+function contextSegment({ tokens, window, percent }) {
+  const used = tokens === undefined ? "" : ` ${formatTokens(tokens)}/${formatTokens(window)}`;
+  return `Context ${bar(percent)} ${formatPercent(percent)}%${used}`;
 }
 
-function windowParts(Text, limit, wide) {
+function limitSegment(limit) {
   const percent = limit.percentUsed ?? 0;
-  const color = colorFor(percent);
   const label = LABELS[limit.kind] ?? limit.kind;
-  const parts = [Text({ bold: true, children: `${label} ` })];
-  if (wide) {
-    parts.push(Text({ color, children: bar(percent) }));
-    parts.push(Text({ children: " " }));
-  }
-  parts.push(Text({ color, bold: true, children: `${formatPercent(percent)}%` }));
   const reset = resetsIn(limit.resetsAt);
-  if (reset) {
-    parts.push(Text({ dimColor: true, children: wide ? `  resets in ${reset}` : ` ↻${reset}` }));
-  }
-  return parts;
-}
-
-function colorFor(percent) {
-  if (percent >= 90) return "red";
-  if (percent >= 75) return "magenta";
-  if (percent >= 50) return "yellow";
-  return "green";
+  return `${label} ${bar(percent)} ${formatPercent(percent)}%${reset ? ` ↻${reset}` : ""}`;
 }
 
 function bar(percent) {
@@ -135,6 +142,12 @@ function bar(percent) {
 
 function formatPercent(percent) {
   return Number.isInteger(percent) ? String(percent) : percent.toFixed(1);
+}
+
+function formatTokens(tokens) {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`;
+  return String(tokens);
 }
 
 function resetsIn(resetsAt) {
