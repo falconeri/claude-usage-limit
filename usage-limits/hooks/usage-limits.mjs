@@ -1,5 +1,5 @@
-// Usage Limits: git branch, context usage and the plan's rate-limit windows,
-// as one status line under the prompt.
+// Usage Limits: model, git branch, context usage and the plan's rate-limit
+// windows, as one line in the band above the prompt.
 //
 // session.start: take a first reading, so the line shows before any turn
 // (limits and context stay empty until the first response reports them).
@@ -31,6 +31,8 @@ let limits = [];
 // until the first response of the window.
 let context = null;
 let branch = "";
+// The resolved model id the session runs on; "" until the engine reports one.
+let model = "";
 let now = 0;
 let ticker = null;
 
@@ -42,6 +44,23 @@ export function register(on) {
     await takeReading($);
     startTicker($);
     return result;
+  });
+
+  // The model is not part of $.session.usage(); it arrives with the settings
+  // hooks' events: SessionStart names it at startup, resume and /clear, and
+  // PostModelSwitch follows every /model change or automatic fallback.
+  on("classic.SessionStart", async ($, e, next) => {
+    if (e.model) {
+      model = e.model;
+      safeDraw($);
+    }
+    return next(e);
+  });
+
+  on("classic.PostModelSwitch", async ($, e, next) => {
+    model = e.to_model;
+    safeDraw($);
+    return next(e);
   });
 
   on("session.measure", async ($, e, next) => {
@@ -57,6 +76,23 @@ export function register(on) {
     branch = await readBranch($);
     draw($);
     return result;
+  });
+
+  // A band above the prompt rather than $.ui.status(): the host puts the
+  // plugin's name in front of every status line, which costs width.
+  on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
+    const text = statusLine();
+    if (!text) {
+      return next(e);
+    }
+    const { Box, Text } = $.ui.resolve(e);
+    const line = Text({ children: [text] });
+    // Keep what the mods after this one draw in the band.
+    const rest = await next(e);
+    if (!rest) {
+      return line;
+    }
+    return Box({ flexDirection: "column", children: [line, rest] });
   });
 }
 
@@ -101,8 +137,26 @@ async function readBranch($) {
   }
 }
 
+// For hooks that sit in front of the engine's own events: a failed redraw must
+// not get in their way.
+function safeDraw($) {
+  try {
+    draw($);
+  } catch {
+    // The next tick or turn redraws.
+  }
+}
+
 function draw($) {
+  $.ui.invalidate("ui.render");
+}
+
+// The line's text, or "" when there is nothing to show yet.
+function statusLine() {
   const segments = [];
+  if (model) {
+    segments.push(`◆ ${modelName(model)}`);
+  }
   if (branch) {
     segments.push(`⎇ ${branch}`);
   }
@@ -112,7 +166,16 @@ function draw($) {
   for (const limit of limits) {
     segments.push(limitSegment(limit));
   }
-  $.ui.status(segments.length > 0 ? segments.join(SEPARATOR) : undefined);
+  return segments.join(SEPARATOR);
+}
+
+// "claude-sonnet-5-5" -> "sonnet-5-5"; drops the vendor prefix, a dated
+// suffix ("-20251001") and a context-size tag ("[1m]").
+function modelName(id) {
+  return id
+    .replace(/^claude-/, "")
+    .replace(/\[.*\]$/, "")
+    .replace(/-\d{8}$/, "");
 }
 
 function sorted(rateLimits) {
@@ -125,7 +188,7 @@ function sorted(rateLimits) {
 
 function contextSegment({ tokens, window, percent }) {
   const used = tokens === undefined ? "" : ` ${formatTokens(tokens)}/${formatTokens(window)}`;
-  return `Context ${bar(percent)} ${formatPercent(percent)}%${used}`;
+  return `ctx ${bar(percent)} ${formatPercent(percent)}%${used}`;
 }
 
 function limitSegment(limit) {
