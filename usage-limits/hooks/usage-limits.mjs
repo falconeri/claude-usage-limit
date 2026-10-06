@@ -13,14 +13,32 @@
 // spelled literally, and helpers that take $ are top-level functions.
 
 const TICK_MS = 60_000;
-const BAR_WIDTH = 10;
-const SEPARATOR = "  │  ";
+const BAR_WIDTH = 8;
+const SEPARATOR = "│";
 
 const LABELS = {
-  five_hour: "Session",
-  seven_day: "Weekly",
-  spend_limit: "Spend",
+  five_hour: "5h",
+  seven_day: "7d",
+  spend_limit: "$",
 };
+
+// How long each window is, to place the elapsed-time marker on its bar.
+const SPAN_MS = {
+  five_hour: 5 * 3_600_000,
+  seven_day: 7 * 24 * 3_600_000,
+};
+
+// Pace tones. A window is green while usage stays at or behind the clock, amber
+// once it runs ahead, red when it runs well ahead or is nearly spent.
+const TONES = {
+  calm: "green",
+  fast: "#d9962b",
+  alert: "red",
+};
+const PACE_ALERT = 15;
+const USED_ALERT = 90;
+// Usage this low stays green early in a window, when the margin is still small.
+const USED_CALM = 10;
 
 // The order windows are drawn in; unknown kinds go last.
 const ORDER = ["five_hour", "seven_day", "spend_limit"];
@@ -81,12 +99,12 @@ export function register(on) {
   // A band above the prompt rather than $.ui.status(): the host puts the
   // plugin's name in front of every status line, which costs width.
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
-    const text = statusLine();
-    if (!text) {
+    const elements = $.ui.resolve(e);
+    const line = statusLine(elements);
+    if (!line) {
       return next(e);
     }
-    const { Box, Text } = $.ui.resolve(e);
-    const line = Text({ children: [text] });
+    const { Box } = elements;
     // Keep what the mods after this one draw in the band.
     const rest = await next(e);
     if (!rest) {
@@ -151,22 +169,33 @@ function draw($) {
   $.ui.invalidate("ui.render");
 }
 
-// The line's text, or "" when there is nothing to show yet.
-function statusLine() {
+// The line as one row of segments split by a dim bar, or undefined when there
+// is nothing to show yet.
+function statusLine({ Box, Text }) {
   const segments = [];
   if (model) {
-    segments.push(`◆ ${modelName(model)}`);
+    segments.push(Text({ key: "model", bold: true, color: "cyan", children: [`◆ ${modelName(model)}`] }));
   }
   if (branch) {
-    segments.push(`⎇ ${branch}`);
+    segments.push(Text({ key: "branch", color: "magenta", children: [`⎇ ${branch}`] }));
   }
   if (context?.percent !== undefined) {
-    segments.push(contextSegment(context));
+    segments.push(contextSegment({ Box, Text }, context));
   }
   for (const limit of limits) {
-    segments.push(limitSegment(limit));
+    segments.push(limitSegment({ Box, Text }, limit));
   }
-  return segments.join(SEPARATOR);
+  if (segments.length === 0) {
+    return undefined;
+  }
+  const children = [];
+  segments.forEach((segment, i) => {
+    if (i > 0) {
+      children.push(Box({ key: `sep-${i}`, paddingX: 1, children: [Text({ dimColor: true, children: [SEPARATOR] })] }));
+    }
+    children.push(segment);
+  });
+  return Box({ flexDirection: "row", flexWrap: "wrap", children });
 }
 
 // "claude-sonnet-5-5" -> "sonnet-5-5"; drops the vendor prefix, a dated
@@ -186,21 +215,73 @@ function sorted(rateLimits) {
   return [...rateLimits].sort((a, b) => rank(a.kind) - rank(b.kind));
 }
 
-function contextSegment({ tokens, window, percent }) {
-  const used = tokens === undefined ? "" : ` ${formatTokens(tokens)}/${formatTokens(window)}`;
-  return `ctx ${bar(percent)} ${formatPercent(percent)}%${used}`;
+// Context has no clock, so its tone follows the fill alone.
+function contextSegment({ Box, Text }, { tokens, window, percent }) {
+  const tone = percent >= 80 ? "alert" : percent >= 50 ? "fast" : "calm";
+  const used = tokens === undefined ? "" : ` · ${formatTokens(tokens)}/${formatTokens(window)}`;
+  return Box({
+    key: "ctx",
+    flexDirection: "row",
+    children: [
+      Text({ key: "label", children: ["ctx "] }),
+      bar(Text, percent, percent, tone),
+      Text({ key: "value", bold: true, children: [` ${formatPercent(percent)}%`] }),
+      Text({ key: "detail", dimColor: true, children: [used] }),
+    ],
+  });
 }
 
-function limitSegment(limit) {
+function limitSegment({ Box, Text }, limit) {
   const percent = limit.percentUsed ?? 0;
   const label = LABELS[limit.kind] ?? limit.kind;
+  const left = limit.resetsAt && now ? Date.parse(limit.resetsAt) - now : NaN;
+  const span = SPAN_MS[limit.kind];
+  const elapsed = span && Number.isFinite(left) ? clamp(100 - (Math.max(0, left) / span) * 100) : percent;
+  const tone = toneOf(percent, elapsed);
   const reset = resetsIn(limit.resetsAt);
-  return `${label} ${bar(percent)} ${formatPercent(percent)}%${reset ? ` ↻${reset}` : ""}`;
+  return Box({
+    key: `limit-${limit.kind}`,
+    flexDirection: "row",
+    children: [
+      Text({ key: "label", children: [`${label} `] }),
+      bar(Text, percent, elapsed, tone),
+      Text({ key: "value", bold: true, color: TONES[tone], children: [` ${formatPercent(percent)}%`] }),
+      Text({ key: "detail", dimColor: true, children: [reset ? ` · ${reset}` : ""] }),
+    ],
+  });
 }
 
-function bar(percent) {
-  const filled = Math.max(0, Math.min(BAR_WIDTH, Math.round((percent / 100) * BAR_WIDTH)));
-  return "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
+// Green while usage stays at or behind the clock, amber once it runs ahead, red
+// when it runs well ahead or the window is nearly spent.
+function toneOf(used, elapsed) {
+  if (used >= USED_ALERT) return "alert";
+  const pace = used - elapsed;
+  if (pace > PACE_ALERT) return "alert";
+  if (pace > 0 && used >= USED_CALM) return "fast";
+  return "calm";
+}
+
+// Thin cells side by side: ━ up to the share used; ╍ for the gap to the time
+// elapsed, in the tone when usage runs ahead and grey when there is margin; ─ for
+// the rest of the window.
+function bar(Text, used, elapsed, tone) {
+  const color = TONES[tone];
+  const usedCells = Math.round((clamp(used) / 100) * BAR_WIDTH);
+  const timeCells = Math.round((clamp(elapsed) / 100) * BAR_WIDTH);
+  const cells = [];
+  for (let i = 0; i < BAR_WIDTH; i++) {
+    const key = `c${i}`;
+    if (i < Math.min(usedCells, timeCells)) cells.push(Text({ key, color, children: ["━"] }));
+    else if (i < usedCells) cells.push(Text({ key, color, children: ["╍"] }));
+    else if (i < timeCells) cells.push(Text({ key, dimColor: true, children: ["╍"] }));
+    else cells.push(Text({ key, dimColor: true, children: ["─"] }));
+  }
+  // One Text per cell, nested so the cells stay on one line with no gaps.
+  return Text({ key: "bar", children: cells });
+}
+
+function clamp(percent) {
+  return Math.max(0, Math.min(100, percent));
 }
 
 function formatPercent(percent) {
@@ -228,7 +309,8 @@ function resetsIn(resetsAt) {
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
   const mins = minutes % 60;
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${mins}m`;
+  // Tight forms: 4d2h, 2h28, 45m.
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${String(mins).padStart(2, "0")}`;
   return `${mins}m`;
 }
