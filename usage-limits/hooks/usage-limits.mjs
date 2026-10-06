@@ -1,5 +1,5 @@
 // Usage Limits: model, git branch, context usage and the plan's rate-limit
-// windows, as one line in the band above the prompt.
+// windows and prompt-cache countdown, as one line in the band above the prompt.
 //
 // session.start: take a first reading, so the line shows before any turn
 // (limits and context stay empty until the first response reports them).
@@ -21,6 +21,13 @@ const LABELS = {
   seven_day: "7d",
   spend_limit: "$",
 };
+
+// The prompt cache lasts 5 minutes after a request, or 1 hour on a subscription
+// within its plan limits. Each request that reads it renews it.
+const CACHE_5M_MS = 5 * 60_000;
+const CACHE_1H_MS = 60 * 60_000;
+// The countdown turns amber under this.
+const CACHE_SOON_MS = 10 * 60_000;
 
 // How long each window is, to place the elapsed-time marker on its bar.
 const SPAN_MS = {
@@ -51,6 +58,13 @@ let context = null;
 let branch = "";
 // The resolved model id the session runs on; "" until the engine reports one.
 let model = "";
+// When the last main-thread request went out, in $.clock.now() milliseconds; 0
+// while unknown (a new, resumed or just compacted session has none to count from).
+let cacheAt = 0;
+// The cache lifetime the environment pins ("5m" or "1h"), "" to infer it, and
+// whether caching is switched off.
+let cacheTtl = "";
+let cacheOff = false;
 let now = 0;
 let ticker = null;
 
@@ -59,6 +73,8 @@ export function register(on) {
     const result = await next(e);
     limits = [];
     context = null;
+    cacheAt = 0;
+    await readCacheEnv($);
     await takeReading($);
     startTicker($);
     return result;
@@ -79,6 +95,29 @@ export function register(on) {
     model = e.to_model;
     safeDraw($);
     return next(e);
+  });
+
+  // Each main-thread request renews the cache (subagents keep their own).
+  on("turn.step", async function* ($, e, next) {
+    if (e.agentId) {
+      return yield* next(e);
+    }
+    const at = await $.clock.now();
+    const result = yield* next(e);
+    if (result?.usage) {
+      cacheAt = at;
+      now = at;
+      draw($);
+    }
+    return result;
+  });
+
+  // A compaction rewrites the prefix: nothing is cached until the next request.
+  on("session.compact", async ($, e, next) => {
+    const result = await next(e);
+    cacheAt = 0;
+    draw($);
+    return result;
   });
 
   on("session.measure", async ($, e, next) => {
@@ -125,6 +164,39 @@ async function takeReading($) {
   }
   branch = await readBranch($);
   draw($);
+}
+
+// Whether caching is off and whether the environment pins its lifetime.
+async function readCacheEnv($) {
+  const read = async (get) => {
+    try {
+      return String((await get()) ?? "").trim();
+    } catch {
+      return "";
+    }
+  };
+  const isOn = (value) => /^(1|true|yes|on)$/i.test(value);
+  cacheOff = isOn(await read(() => $.env.get("DISABLE_PROMPT_CACHING")));
+  const ttl = await read(() => $.env.get("CLAUDE_CODE_PROMPT_CACHE_TTL"));
+  if (isOn(await read(() => $.env.get("FORCE_PROMPT_CACHING_5M")))) {
+    cacheTtl = "5m";
+  } else if (ttl === "5m" || ttl === "1h") {
+    cacheTtl = ttl;
+  } else if (isOn(await read(() => $.env.get("ENABLE_PROMPT_CACHING_1H")))) {
+    cacheTtl = "1h";
+  } else {
+    cacheTtl = "";
+  }
+}
+
+// A subscription within its plan limits gets the 1-hour cache; an API key or
+// usage credits, 5 minutes. The limit windows only exist on a subscription.
+function cacheLifetimeMs() {
+  if (cacheTtl) {
+    return cacheTtl === "1h" ? CACHE_1H_MS : CACHE_5M_MS;
+  }
+  const plan = limits.filter((l) => l.kind === "five_hour" || l.kind === "seven_day");
+  return plan.length > 0 && plan.every((l) => (l.percentUsed ?? 0) < 100) ? CACHE_1H_MS : CACHE_5M_MS;
 }
 
 // Redraws once a minute so "resets in" counts down while the session idles.
@@ -184,6 +256,10 @@ function statusLine({ Box, Text }) {
   }
   for (const limit of limits) {
     segments.push(limitSegment({ Box, Text }, limit));
+  }
+  const cache = cacheSegment({ Box, Text });
+  if (cache) {
+    segments.push(cache);
   }
   if (segments.length === 0) {
     return undefined;
@@ -249,6 +325,33 @@ function limitSegment({ Box, Text }, limit) {
       Text({ key: "detail", dimColor: true, children: [reset ? ` · ${reset}` : ""] }),
     ],
   });
+}
+
+// The time before the prompt cache lapses: green while it is long, amber under
+// ten minutes, red once it has lapsed (the next message writes the context again).
+// Nothing until a request gives it a start.
+function cacheSegment({ Box, Text }) {
+  if (cacheOff || !cacheAt || !now) {
+    return undefined;
+  }
+  const left = cacheAt + cacheLifetimeMs() - now;
+  const tone = left <= 0 ? "alert" : left < CACHE_SOON_MS ? "fast" : "calm";
+  return Box({
+    key: "cache",
+    flexDirection: "row",
+    children: [
+      Text({ key: "label", children: ["cache "] }),
+      Text({ key: "value", bold: true, color: TONES[tone], children: [left <= 0 ? "expired" : shortSpan(left)] }),
+    ],
+  });
+}
+
+// 52m, 1h00; under a minute, "<1m".
+function shortSpan(ms) {
+  const minutes = Math.ceil(ms / 60_000);
+  if (minutes < 1) return "<1m";
+  if (minutes >= 60) return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}`;
+  return `${minutes}m`;
 }
 
 // Green while usage stays at or behind the clock, amber once it runs ahead, red

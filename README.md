@@ -6,7 +6,7 @@ Personal Claude Code mods, published as a plugin marketplace named `local-mods`.
 
 | Mod | What it does |
 | --- | --- |
-| [usage-limits](usage-limits/README.md) | Shows the 5-hour session and weekly plan usage limits in the band above the prompt. |
+| [usage-limits](usage-limits/README.md) | Shows the model, git branch, context fill, 5-hour and weekly plan limits and the prompt-cache countdown as one compact, colored line above the prompt. |
 
 ## Install
 

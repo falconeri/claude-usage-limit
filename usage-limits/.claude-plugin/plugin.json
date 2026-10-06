@@ -1,6 +1,6 @@
 {
   "name": "usage-limits",
-  "version": "0.1.0",
-  "description": "Status line under the prompt: git branch, context usage, and plan usage limits (5-hour session and weekly) with reset times.",
+  "version": "0.2.0",
+  "description": "Band above the prompt: model, git branch, context usage, plan usage limits (5h and 7d) with reset times, and the prompt-cache countdown.",
   "author": { "name": "Alta Falconeri" }
 }
